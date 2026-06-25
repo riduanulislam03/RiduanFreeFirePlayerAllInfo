@@ -16,21 +16,18 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad as crypto_pad, unpad as crypto_unpad
 from werkzeug.exceptions import HTTPException
 
-# === Local Imports ===
 from config import Config
 from Pb2 import FreeFire_pb2, main_pb2, AccountPersonalShow_pb2
 import game_version
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# === Flask App Setup ===
 app = Flask(__name__)
 CORS(app)
 app.json.sort_keys = False 
 cache = TTLCache(maxsize=100, ttl=300)
 cached_tokens = defaultdict(dict)
 
-# === Free Fire Level Experience Mapping ===
 LEVELS = {
     "1": 0, "2": 48, "3": 202, "4": 544, "5": 1012, "6": 1844, "7": 2792, "8": 3800,
     "9": 4870, "10": 6004, "11": 7192, "12": 8448, "13": 9776, "14": 11140, "15": 12566,
@@ -70,7 +67,6 @@ async def json_to_proto(json_data: str, proto_message: Message) -> bytes:
     json_format.ParseDict(json.loads(json_data), proto_message)
     return proto_message.SerializeToString()
 
-# === Time & Age Helpers ===
 def format_timestamp(ts):
     try:
         if not ts or str(ts) == "0": return "N/A"
@@ -93,18 +89,25 @@ def get_detailed_time_diff(timestamp):
         weeks = diff // 604800
         diff %= 604800
         days = diff // 86400
+        diff %= 86400
+        hours = diff // 3600
+        diff %= 3600
+        minutes = diff // 60
+        seconds = diff % 60
 
         parts = []
         if years > 0: parts.append(f"{years} Years")
         if months > 0: parts.append(f"{months} Months")
         if weeks > 0: parts.append(f"{weeks} Weeks")
         if days > 0: parts.append(f"{days} Days")
+        if hours > 0: parts.append(f"{hours} Hours")
+        if minutes > 0: parts.append(f"{minutes} Minutes")
+        if seconds > 0 or not parts: parts.append(f"{seconds} Seconds")
 
-        return " ".join(parts) if parts else "Less than a day"
+        return " ".join(parts)
     except Exception:
         return "N/A"
 
-# === Level Progress Calculation ===
 def get_exp_for_level(level):
     try:
         return LEVELS.get(str(int(level)), 0)
@@ -119,6 +122,7 @@ def calculate_level_progress(current_exp, current_level):
         if current_level >= 100:
             return {
                 "CurrentLevel": current_level,
+                "NextLevel": 100,
                 "CurrentExp": current_exp,
                 "ExpForCurrentLevel": LEVELS["100"],
                 "ExpForNextLevel": LEVELS["100"],
@@ -140,6 +144,7 @@ def calculate_level_progress(current_exp, current_level):
             
         return {
             "CurrentLevel": current_level,
+            "NextLevel": current_level + 1,
             "CurrentExp": current_exp,
             "ExpForCurrentLevel": exp_for_current,
             "ExpForNextLevel": exp_for_next,
@@ -158,7 +163,6 @@ def run_async(coro):
         new_loop.close()
         asyncio.set_event_loop(None)
 
-# === Garena Ban Status Checker ===
 async def check_ban_status_garena(uid):
     ban_url = f'https://ff.garena.com/api/antihack/check_banned?lang=en&uid={uid}'
     ban_headers = {
@@ -178,7 +182,6 @@ async def check_ban_status_garena(uid):
         pass
     return 0
 
-# === Authentication & Token Handling ===
 async def get_access_token(account: str):
     url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
     payload = account + "&response_type=token&client_type=2&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3&client_id=100067"
@@ -232,7 +235,6 @@ async def get_token_info(region: str) -> Tuple[str, str, str]:
     info = cached_tokens[region]
     return info['token'], info['region'], info['server_url']
 
-# === Fetch Core Account Data ===
 async def GetAccountInformation(uid, unk, region, endpoint):
     payload = await json_to_proto(json.dumps({'a': uid, 'b': unk}), main_pb2.GetPlayerPersonalShow())
     data_enc = aes_cbc_encrypt(Config.MAIN_KEY, Config.MAIN_IV, payload)
@@ -270,7 +272,6 @@ async def auto_detect_region_and_data(uid):
             return region, data
     return None, None
 
-# === Clean JSON Response Formatter ===
 def format_response(data, is_banned):
     if not isinstance(data, dict): data = {}
         
@@ -316,16 +317,13 @@ def format_response(data, is_banned):
             "Signature": social_info.get("signature", "N/A")
         },
         "LevelProgressInfo": level_progress if level_progress else {},
-        
-        # অ্যাকাউন্টের বয়স আলাদা অপশন হিসেবে সেট করা হয়েছে
         "AccountAgeInfo": {
             "AccountAge": get_detailed_time_diff(create_ts),
             "AccountCreateDate": format_timestamp(create_ts),
             "AccountCreateTimestamp": create_ts
         },
-        
         "BanCheckInfo": {
-            "Ban_Status": "Account Banned ⛔" if is_banned else "Not Banned ✅",
+            "BanStatus": "Account Banned" if is_banned else "Not Banned",
             "BanDuration": get_detailed_time_diff(login_ts) if is_banned else "N/A"
         },
         "PlayerRankInfo": {
@@ -373,7 +371,7 @@ def format_response(data, is_banned):
 @app.errorhandler(Exception)
 def handle_exception(e):
     if isinstance(e, HTTPException): return jsonify({"error": e.description}), e.code
-    return jsonify({"error": f"Server Error: {str(e)}"}), 500
+    return jsonify({"error": str(e)}), 500
 
 @app.route('/')
 def root_guide():
@@ -402,13 +400,12 @@ def get_account_info():
         if not region or not raw_data: 
             return jsonify({"error": "Player not found in any supported region or invalid UID."}), 404
         
-        # শুধুমাত্র Ban Check টাস্ক রান করা হচ্ছে 
         is_banned = run_async(check_ban_status_garena(uid))
         
         formatted = format_response(raw_data, is_banned)
         return jsonify(formatted), 200
     except Exception as e:
-        return jsonify({"error": f"Data fetch failed: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/refresh', methods=['GET', 'POST'])
 def refresh_tokens_endpoint():
@@ -416,7 +413,7 @@ def refresh_tokens_endpoint():
         run_async(initialize_tokens())
         return jsonify({'message': 'Tokens refreshed successfully.'}), 200
     except Exception as e:
-        return jsonify({'error': f'Refresh failed: {e}'}), 500
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=Config.PORT, debug=Config.DEBUG)
